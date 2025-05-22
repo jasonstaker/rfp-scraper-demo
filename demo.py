@@ -1,5 +1,6 @@
 import requests
 import pandas as pd
+import excel_export
 from bs4 import BeautifulSoup
 from urllib.parse import parse_qsl, urlencode
 from io import StringIO
@@ -19,19 +20,15 @@ KEYWORD_FILE = 'config/keywords.txt'
 def _scrape_hidden_fields(html_text):
     soup = BeautifulSoup(html_text, 'html.parser')
     hidden_inputs = {}
-
     for hidden in soup.find_all("input", type="hidden"):
         name = hidden.get("name")
         value = hidden.get("value", "")
         if name:
             hidden_inputs[name] = value
-
     return hidden_inputs
-
 
 def build_search_payload(hidden_fields):
     data = {**hidden_fields}
-
     data["hdnUserValue"] = "%2Cbody_x_txtRfpAwarded_1"
     data["__LASTFOCUS"] = "body_x_prxFilterBar_x_cmdSearchBtn"
     data["__EVENTTARGET"] = "body:x:prxFilterBar:x:cmdSearchBtn"
@@ -62,7 +59,6 @@ def build_search_payload(hidden_fields):
     data["body:x:txtRfpAwarded_1"] = "False"
     data["body_x_selOrgaLevelOrgaNode_78E9FF04_1_text"] = ""
     data["body:x:selOrgaLevelOrgaNode_78E9FF04_1"] = ""
-
     tr_checks = [
         "body:x:grid:grd:tr_2884:ctrl_txtRfpAwarded=False",
         "body:x:grid:grd:tr_2001:ctrl_txtRfpAwarded=False",
@@ -83,36 +79,29 @@ def build_search_payload(hidden_fields):
     for entry in tr_checks:
         key, val = entry.split("=", 1)
         data[key] = val
-
     data["hdnSortExpressionbody_x_grid_grd"] = ""
     data["hdnSortDirectionbody_x_grid_grd"] = ""
     data["hdnCurrentPageIndexbody_x_grid_grd"] = "0"
     data["hdnRowCountbody_x_grid_grd"] = "100"
     data["maxpageindexbody_x_grid_grd"] = "6"
     data["ajaxrowsiscountedbody_x_grid_grd"] = "True"
-
     if "CSRFToken" in hidden_fields:
         data["CSRFToken"] = hidden_fields["CSRFToken"]
     else:
         data["CSRFToken"] = FALLBACK_CSRF
-
     return urlencode(data, safe=':/|%')
-
 
 def build_pagination_payload(page_num, hidden_fields):
     focus_idx = page_num - 1
     arg_idx = page_num - 1
     curr_idx = page_num - 2
-
     data = {
         "__LASTFOCUS": f"body_x_grid_PagerBtn{focus_idx}Page",
         "__EVENTTARGET": "body_x_grid_grd",
         "__EVENTARGUMENT": f"Page|{arg_idx}",
         **hidden_fields
     }
-
     data["hdnCurrentPageIndexbody_x_grid_grd"] = str(curr_idx)
-
     extras = {
         "hdnUserValue": "",
         "HTTP_RESOLUTION": "",
@@ -146,111 +135,90 @@ def build_pagination_payload(page_num, hidden_fields):
         "maxpageindexbody_x_grid_grd": hidden_fields.get("maxpageindexbody_x_grid_grd", ""),
         "ajaxrowsiscountedbody_x_grid_grd": hidden_fields.get("ajaxrowsiscountedbody_x_grid_grd", "False"),
     }
-
     if "CSRFToken" in hidden_fields:
         extras["CSRFToken"] = hidden_fields["CSRFToken"]
     else:
         extras["CSRFToken"] = FALLBACK_CSRF
-
     for k, v in extras.items():
         if k not in data:
             data[k] = v
-
     return urlencode(data, safe=":/|%")
-
 
 def search_and_paginate_rfps():
     session = requests.Session()
     session.headers.update(HEADERS)
-
     resp0 = session.get(STATE_RFP_URL)
     if resp0.status_code != 200:
-        print("Initial GET failed:", resp0.status_code)
+        print(resp0.status_code)
         return pd.DataFrame()
-
     hidden = _scrape_hidden_fields(resp0.text)
-
     payload_search = build_search_payload(hidden)
     payload_dict = dict(parse_qsl(payload_search))
-
     resp_search = session.post(STATE_RFP_URL, data=payload_dict)
     if resp_search.status_code != 200:
-        print("Search POST failed:", resp_search.status_code)
+        print(resp_search.status_code)
         return pd.DataFrame()
-
     hidden = _scrape_hidden_fields(resp_search.text)
-
     dfs = []
     try:
         df_page1 = pd.read_html(StringIO(resp_search.text))[4].reset_index(drop=True)
         dfs.append(df_page1)
     except Exception:
-        print("No table found on search results (page 1).")
         return pd.DataFrame()
-
     page_num = 2
     while True:
         payload_page = build_pagination_payload(page_num, hidden)
         payload_dict = dict(parse_qsl(payload_page))
-
         resp_page = session.post(STATE_RFP_URL, data=payload_dict)
         if resp_page.status_code != 200:
             break
-
         new_hidden = _scrape_hidden_fields(resp_page.text)
         if not new_hidden.get("__VIEWSTATE"):
             break
         hidden = new_hidden
-
         try:
             df_next = pd.read_html(StringIO(resp_page.text))[4].reset_index(drop=True)
         except Exception:
             break
-
         if df_next.equals(dfs[-1]):
             break
-
         dfs.append(df_next)
         page_num += 1
-
     if not dfs:
         return pd.DataFrame()
     return pd.concat(dfs, ignore_index=True)
-
 
 def filter_by_keywords(df, keyword_file_path=KEYWORD_FILE):
     try:
         with open(keyword_file_path, 'r', encoding='utf-8') as f:
             keywords = [line.strip().lower() for line in f if line.strip()]
     except FileNotFoundError:
-        print(f"Keyword file not found at path: {keyword_file_path}")
         return pd.DataFrame()
-
-    if "Label" not in df.columns:
-        print("Error: no 'Label' column found in scraped table.")
+    if df.empty or not keywords:
         return pd.DataFrame()
-
-    matched = []
-    for _, row in df[df['Label'].notna()].iterrows():
-        lbl = row['Label'].lower()
-        for kw in keywords:
-            if kw in lbl:
-                matched.append(row.to_dict())
-                break
-
-    return pd.DataFrame(matched)
+    hits = []
+    for idx, row in df[df['Label'].notna()].iterrows():
+        txt = row['Label'].lower()
+        count = sum(1 for kw in keywords if kw in txt)
+        if count > 0:
+            hits.append((idx, count))
+    if not hits:
+        return pd.DataFrame()
+    indices, vals = zip(*hits)
+    temp_df = df.loc[list(indices)].copy().reset_index(drop=True)
+    temp_df['Keyword Hits'] = list(vals)
+    temp_df = temp_df.sort_values(by='Keyword Hits', ascending=False).reset_index(drop=True)
+    return temp_df
 
 def main():
     all_pages_df = search_and_paginate_rfps()
     if all_pages_df.empty:
-        print("No RFP data retrieved (search or pagination returned no tables).")
         return
-
     matched_df = filter_by_keywords(all_pages_df)
     if matched_df.empty:
-        print("No matches found for your keywords.")
-    else:
-        print(matched_df.drop_duplicates(subset='Code'))
+        return
+    final_df = matched_df.drop(columns=['Editing column']).drop_duplicates(subset='Code')
+    excel_export.export(final_df, 'Arizona')
 
 if __name__ == "__main__":
     main()
